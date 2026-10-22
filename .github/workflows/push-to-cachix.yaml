@@ -1,0 +1,47 @@
+name: push-to-cachix
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Select environment
+        required: true
+        type: choice
+        options:
+          - hooreique
+
+jobs:
+  push-to-cachix:
+    strategy:
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Check required vars
+        run: >
+          [ -n "${{ secrets.CACHIX_AUTH_TOKEN }}" ] &&
+          [ -n "${{ vars.CACHIX_CACHE }}" ] ||
+          { echo "Missing required vars"; exit 1; }
+
+      - uses: actions/checkout@main
+
+      - uses: cachix/install-nix-action@master
+
+      - uses: cachix/cachix-action@master
+        with:
+          name: ${{ vars.CACHIX_CACHE }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build all packages
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          packages=$(nix eval --json ".#packages.$SYSTEM" --apply builtins.attrNames)
+          mapfile -t installables < <(jq -r --arg system "$SYSTEM" '.[] | ".#packages.\($system).\(.)"' <<< "$packages")
+          nix build "${installables[@]}"
