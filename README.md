@@ -48,6 +48,34 @@ Installing the CLI into a profile does not install the service. The service's
 Caddy executable is retained by a separate Nix GC root, including when the CLI
 was invoked with `nix run`.
 
+If a gateway forwards external port 80 to local port 8080 and external port 443
+to local port 8443, install with:
+
+```sh
+hooddy install --http-port 8080 --https-port 8443
+hooddy start
+```
+
+These install-only options set Caddy's global `http_port` and `https_port`.
+Each accepts a port from 1 to 65535; you can specify either or both. Omitted
+options leave Caddy's defaults unchanged. Site addresses still use ordinary
+domains without the internal port, and automatic HTTPS remains enabled.
+
+Port options require a new main Caddyfile. If one already exists, hooddy fails
+without changing it; edit its existing global options block directly instead:
+
+```caddyfile
+{
+    admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock
+    http_port 8080
+    https_port 8443
+}
+
+import sites.d/*.caddy
+```
+
+For an installed service, apply that edit with `hooddy restart`.
+
 ## Add sites
 
 The default configuration directory is `~/.config/hooddy`. When
@@ -107,7 +135,7 @@ An existing main Caddyfile is preserved when installing or reinstalling.
 
 | Command | Behavior |
 | --- | --- |
-| `install` | Require an absent installation; install and enable linger, without enabling or starting the service. |
+| `install [--http-port PORT] [--https-port PORT]` | Require an absent installation; install and enable linger, without enabling or starting the service. |
 | `uninstall` | Require an installation; disable, stop, and remove it. |
 | `uninstall --disable-linger` | Also disable linger for the user. This affects all of that user's services. |
 | `start` | Enable and start; succeed if already running. |

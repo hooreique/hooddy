@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,117 @@ class LifecycleTests(unittest.TestCase):
         calls = self.state()["calls"]
         self.assertIn("already installed", self.cli("install", code=1).stderr)
         self.assertEqual(self.state()["calls"], calls)
+
+    def test_install_default_ports_leave_config_unchanged(self):
+        self.cli("install")
+        self.assertEqual((self.directory / "Caddyfile").read_text(),
+                         "{\n  admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock\n"
+                         "}\n\nimport sites.d/*.caddy\n")
+
+    def test_install_individual_port_options(self):
+        for option, directive, value in [
+                ("--http-port", "http_port", "00080"),
+                ("--https-port", "https_port", "65535")]:
+            with self.subTest(option=option):
+                self.cli("install", option, value)
+                config = self.directory / "Caddyfile"
+                text = config.read_text()
+                self.assertIn(f"  {directive} {int(value)}\n", text)
+                other = "https_port" if directive == "http_port" else "http_port"
+                self.assertNotIn(other, text)
+                self.cli("uninstall")
+                config.unlink()
+
+    def test_invalid_port_options_have_no_side_effects(self):
+        for option in ["--http-port", "--https-port"]:
+            for value in ["", "0", "65536", "-1", "1.5", "abc",
+                          "999999999999999999999", "80\n443"]:
+                with self.subTest(option=option, value=value):
+                    self.cli("install", option, value, code=1)
+            self.cli("install", option, code=1)
+            self.cli("install", option, "8080", option, "8081", code=1)
+            for command in ["start", "stop", "restart", "uninstall"]:
+                self.cli(command, option, "8080", code=1)
+        self.cli("install", "--http-port", "8080", "--https-port", "8080", code=1)
+        self.assertEqual(self.state()["calls"], [])
+        self.assertFalse(self.directory.exists())
+
+    def test_port_options_do_not_overwrite_existing_caddyfile(self):
+        self.directory.mkdir(parents=True)
+        config = self.directory / "Caddyfile"
+        content = "{\n debug\n}\n"
+        config.write_text(content)
+        result = self.cli("install", "--http-port", "8080", code=1)
+        self.assertIn("set http_port and https_port directly", result.stderr)
+        self.assertEqual(config.read_text(), content)
+        self.assertEqual(self.state()["linger"], "no")
+        self.assertFalse(self.unit.exists())
+
+    def test_real_caddy_forwarded_ports_and_https_redirect(self):
+        # Reserve two ephemeral ports until installation is complete.
+        with socket.socket() as http_listener, socket.socket() as https_listener:
+            http_listener.bind(("127.0.0.1", 0))
+            https_listener.bind(("127.0.0.1", 0))
+            http_port = http_listener.getsockname()[1]
+            https_port = https_listener.getsockname()[1]
+            self.cli("install", "--http-port", str(http_port),
+                     "--https-port", str(https_port))
+        self.site("foo.caddy", "foo.test {\n bind 127.0.0.1\n"
+                  " tls internal\n respond hello\n}\n")
+        (self.runtime / "hooddy").mkdir()
+        config = self.directory / "Caddyfile"
+        config.write_text(config.read_text().replace(
+            "{\n", "{\n  skip_install_trust\n", 1))
+        env = self.env | {"XDG_DATA_HOME": str(self.data)}
+        with (self.root / "caddy.log").open("w+") as log:
+            process = subprocess.Popen(
+                [CADDY, "run", "--config", str(config), "--adapter", "caddyfile"],
+                env=env, stdout=log, stderr=log)
+            try:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                for _ in range(100):
+                    try:
+                        with socket.create_connection(("127.0.0.1", https_port),
+                                                      timeout=1) as raw:
+                            with context.wrap_socket(raw, server_hostname="foo.test"):
+                                break
+                    except (OSError, ssl.SSLError):
+                        if process.poll() is not None:
+                            log.seek(0)
+                            self.fail(log.read())
+                        time.sleep(0.05)
+                else:
+                    self.fail("Caddy HTTPS listener did not become ready")
+                connection = http.client.HTTPConnection("127.0.0.1", http_port, timeout=5)
+                try:
+                    connection.request("GET", "/path?q=1", headers={"Host": "foo.test"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 308)
+                    self.assertEqual(response.getheader("Location"),
+                                     "https://foo.test/path?q=1")
+                    response.read()
+                finally:
+                    connection.close()
+                with socket.create_connection(("127.0.0.1", https_port), timeout=5) as raw:
+                    with context.wrap_socket(raw, server_hostname="foo.test") as secured:
+                        connection = http.client.HTTPConnection("foo.test")
+                        connection.sock = secured
+                        try:
+                            connection.request("GET", "/")
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.read(), b"hello")
+                        finally:
+                            connection.close()
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
     def test_start_and_stop_are_idempotent(self):
         self.cli("install")

@@ -10,7 +10,8 @@ Usage: hooddy COMMAND [OPTIONS]
        hooddy --version
 
 Commands:
-  install                    Install without enabling or starting the service;
+  install [--http-port PORT] [--https-port PORT]
+                             Install without enabling or starting the service;
                              enable user linger if needed. Fail if installed.
   uninstall [--disable-linger]
                              Stop, disable, and uninstall the service.
@@ -26,6 +27,9 @@ start, stop, and restart are idempotent.
 Configuration: $XDG_CONFIG_HOME/hooddy (default: ~/.config/hooddy)
 Site files:    sites.d/*.caddy, containing ordinary Caddyfile site blocks
 Service:       hooddy.service in the current user's systemd manager
+
+Port options apply only to install with a new Caddyfile (ports 1-65535).
+Omitted ports use Caddy defaults. Existing Caddyfiles must be edited directly.
 
 Run as the service's user. Linux, systemd user services, and Nix are required.
 EOF
@@ -57,11 +61,31 @@ case "$command_name" in
 esac
 
 disable_linger=0
-for argument in "$@"; do
+http_port=""
+https_port=""
+while (( $# > 0 )); do
+  argument=$1
+  shift
   case "$argument" in
     --help|-h)
       usage
       exit 0
+      ;;
+    --http-port|--https-port)
+      [[ $command_name == install ]] || die "$argument is only valid with install"
+      (( $# > 0 )) || die "$argument requires a port (1-65535)"
+      port=$1
+      shift
+      [[ $port =~ ^[0-9]{1,5}$ ]] || die "$argument requires a port (1-65535)"
+      port=$((10#$port))
+      (( port >= 1 && port <= 65535 )) || die "$argument requires a port (1-65535)"
+      if [[ $argument == --http-port ]]; then
+        [[ -z $http_port ]] || die "--http-port specified more than once"
+        http_port=$port
+      else
+        [[ -z $https_port ]] || die "--https-port specified more than once"
+        https_port=$port
+      fi
       ;;
     --disable-linger)
       [[ $command_name == uninstall ]] || die "--disable-linger is only valid with uninstall"
@@ -70,6 +94,9 @@ for argument in "$@"; do
     *) die "unexpected argument: $argument (see hooddy --help)" ;;
   esac
 done
+if [[ -n $http_port && -n $https_port ]]; then
+  [[ $http_port != "$https_port" ]] || die "HTTP and HTTPS ports must differ"
+fi
 
 [[ $OSTYPE == linux* ]] || die "only Linux with systemd user services is supported"
 [[ -n ${HOME:-} ]] || die "HOME must be set"
@@ -155,6 +182,7 @@ install_service() {
   [[ -z $existing_fragment ]] || die "a unit already exists at $existing_fragment"
   if path_exists "$caddyfile"; then
     [[ -f $caddyfile ]] || die "Caddyfile is not a regular file: $caddyfile"
+    [[ -z $http_port && -z $https_port ]] || die "Caddyfile already exists; set http_port and https_port directly in $caddyfile"
   fi
   set_linger yes
 
@@ -179,13 +207,18 @@ install_service() {
 
   mkdir -p -- "$config_dir/sites.d" "$unit_dir"
   if ! path_exists "$caddyfile"; then
-    cat >"$caddyfile" <<'EOF'
-{
-  admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock
-}
-
-import sites.d/*.caddy
-EOF
+    {
+      # Caddy expands this environment placeholder when it loads the file.
+      # shellcheck disable=SC2016
+      printf '{\n  admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock\n'
+      if [[ -n $http_port ]]; then
+        printf '  http_port %s\n' "$http_port"
+      fi
+      if [[ -n $https_port ]]; then
+        printf '  https_port %s\n' "$https_port"
+      fi
+      printf '}\n\nimport sites.d/*.caddy\n'
+    } >"$caddyfile"
   fi
 
   created_root=1
