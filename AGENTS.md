@@ -5,10 +5,9 @@
 - Work in `nix develop`.
 - Support only `x86_64-linux` and `aarch64-linux`, using the local `forAllSys`
   helper. Do not add flake-utils, flake-parts, NixOS modules, or Home Manager modules.
-- Keep site files ordinary Caddyfiles. Applications must not depend on the hooddy
-  CLI or on additional registration metadata.
-- Preserve the strict install/uninstall preconditions and idempotent
-  start/stop/restart behavior documented in the README.
+- Keep site files ordinary Caddyfiles. Applications must not depend on the
+  hooddy CLI at runtime.
+- Preserve the idempotent start/stop/restart behavior documented in the README.
 - Stage new files with `git add` before evaluating the flake so Nix can see them.
 - Do not install or operate the real user's service to test changes. The tests
   use isolated systemd/logind/Nix substitutes and a temporary local Caddy process.
