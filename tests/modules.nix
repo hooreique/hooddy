@@ -7,8 +7,9 @@ let
   evaluate = modules: hooddyConfiguration { inherit system modules; };
   fails = args: !(builtins.tryEval (hooddyConfiguration args).activationPackage.drvPath).success;
   invalid = modules: fails { inherit system modules; };
-  generation = evaluate (fixtures ++ [ enabled ]);
+  generation = evaluate (fixtures ++ [ enabled { hooddy.httpPort = 8080; hooddy.httpsPort = 8443; } ]);
   empty = evaluate fixtures;
+  disabled = evaluate (fixtures ++ [ enabled { hooddy.enable = false; } ]);
   unit = ''
     [Service]
     ExecStart=${pkgs.coreutils}/bin/sleep infinity
@@ -20,7 +21,7 @@ let
     (empty.config.hooddy.services == { })
     (empty.config.hooddy.sites == { })
     (builtins.attrNames generation.config.hooddy.services == [ "buku-journal" "bukupan" ])
-    (builtins.attrNames generation.options.hooddy == [ "services" "sites" ])
+    (empty.config.hooddy.enable && empty.config.hooddy.httpPort == null && empty.config.hooddy.httpsPort == null)
     (lib.all (target: (hooddyConfiguration { system = target; modules = fixtures ++ [ enabled ]; }).activationPackage.system == target) [ "x86_64-linux" "aarch64-linux" ])
     (lib.all (url: (builtins.tryEval (evaluate [ { hooddy.services.app = service // { healthCheck = { inherit url; timeoutSeconds = 1; }; }; } ]).activationPackage.drvPath).success) [ "http://localhost/health" "http://127.0.0.1/health" "http://[::1]:3000/health" ])
     ((evaluate [ { hooddy.services.app = { inherit unit; }; } ]).config.hooddy.services.app.healthCheck == null)
@@ -35,6 +36,8 @@ let
     (invalid [ { hooddy.sites.missing = { }; } ])
     (invalid [ { hooddy.services.missing = { }; } ])
     (invalid [ { hooddy.sites.wrong.config = 3; } ])
+    (invalid [ { hooddy.httpPort = 0; } ])
+    (invalid [ { hooddy.httpsPort = 65536; } ])
     (invalid [ { hooddy.services.app = service // { healthCheck.timeoutSeconds = 0; healthCheck.url = "http://127.0.0.1/"; }; } ])
     (invalid [ { hooddy.services.app = service // { healthCheck.url = "http://127.0.0.1/"; }; } ])
     (invalid [ { hooddy.services.app = service // { healthCheck.url = "https://127.0.0.1/"; healthCheck.timeoutSeconds = 1; }; } ])
@@ -65,32 +68,38 @@ pkgs.runCommand "hooddy-module-tests" {
   export HOME="$TMPDIR/home"
   export XDG_RUNTIME_DIR="$TMPDIR/run"
   mkdir -m 700 "$HOME" "$XDG_RUNTIME_DIR"
-  python3 - ${generation.activationPackage} ${empty.activationPackage} <<'PY'
+  python3 - ${generation.activationPackage} ${empty.activationPackage} ${disabled.activationPackage} <<'PY'
   import json
   import pathlib
   import sys
-  generation, empty = map(pathlib.Path, sys.argv[1:])
+  generation, empty, disabled = map(pathlib.Path, sys.argv[1:])
   manifest = json.loads((generation / "manifest.json").read_text())
-  assert manifest["protocolVersion"] == 1
+  assert manifest["protocolVersion"] == 2
+  assert manifest["enabled"] is True
+  assert manifest["caddy"] == "${lib.getExe pkgs.caddy}"
   assert manifest["system"] == "${system}"
   assert sorted(manifest["services"]) == ["buku-journal", "bukupan"]
   assert all((generation / item["unit"]).is_file() for item in manifest["services"].values())
   assert manifest["services"]["bukupan"]["healthCheck"]["url"] == "http://127.0.0.1:3001/"
-  sites = (generation / "sites.caddy").read_text()
-  assert sites.index("buku-journal.example.test") < sites.index("bukupan.example.test")
-  assert "/nix/store/" in sites
-  assert (empty / "sites.caddy").read_text() == ""
+  config = (generation / "Caddyfile").read_text()
+  assert config.index("buku-journal.example.test") < config.index("bukupan.example.test")
+  assert "admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock" in config
+  assert "http_port 8080" in config and "https_port 8443" in config
+  directives = (generation / "units/hooddy.service").read_text().splitlines()
+  for directive, command in [("ExecStart", "run"), ("ExecReload", "reload")]:
+      line = next(line for line in directives if line.startswith(directive + "="))
+      executable, operation, flag, store_config, *args = line.split("=", 1)[1].split()
+      assert (executable, operation, flag, args) == (manifest["caddy"], command, "--config", ["--adapter", "caddyfile"])
+      assert pathlib.Path(store_config).read_text() == config
+  assert "http_port" not in (empty / "Caddyfile").read_text()
   assert json.loads((empty / "manifest.json").read_text())["services"] == {}
+  assert [path.name for path in disabled.iterdir()] == ["manifest.json"]
+  manifest = json.loads((disabled / "manifest.json").read_text())
+  assert manifest["enabled"] is False and manifest["services"] == {} and manifest["caddy"] is None
   PY
   systemd-analyze --user verify ${generation.activationPackage}/units/*.service
   for generation in ${generation.activationPackage} ${empty.activationPackage}; do
-    cat > "$TMPDIR/Caddyfile" <<EOF
-  {
-    admin off
-  }
-  import $generation/sites.caddy
-  EOF
-    caddy validate --adapter caddyfile --config "$TMPDIR/Caddyfile" > "$TMPDIR/caddy.log" 2>&1 || { cat "$TMPDIR/caddy.log"; exit 1; }
+    caddy validate --adapter caddyfile --config "$generation/Caddyfile"
   done
   touch "$out"
 ''

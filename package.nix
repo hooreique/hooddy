@@ -2,25 +2,23 @@
   lib,
   writeShellApplication,
   writeText,
-  caddy,
   coreutils,
   nix,
   python3,
   systemd,
-  util-linux,
 }:
 let
-  version = "0.1.0";
+  version = "0.2.0";
   script = builtins.replaceStrings
-    [ "@version@" "@caddy@" "@python@" "@switch@" ]
-    [ version "${caddy}" "${python3}/bin/python3" "${./hooddy-switch.py}" ] (
+    [ "@version@" "@python@" "@switch@" ]
+    [ version "${python3}/bin/python3" "${./hooddy-switch.py}" ] (
     builtins.readFile ./hooddy.sh
   );
 in
 writeShellApplication {
   name = "hooddy";
   derivationArgs = { inherit version; };
-  runtimeInputs = [ coreutils nix systemd util-linux ];
+  runtimeInputs = [ coreutils nix systemd ];
   text = script;
 
   passthru.testScript = writeText "hooddy-test-script" script;

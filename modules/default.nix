@@ -1,9 +1,21 @@
 { lib, ... }:
 let
   inherit (lib) mkOption types;
+  portOption = protocol: mkOption {
+    type = types.nullOr (types.ints.between 1 65535);
+    default = null;
+    description = "Override Caddy's default ${protocol} port.";
+  };
 in
 {
   options.hooddy = {
+    enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Run the shared Caddy server and declared application services.";
+    };
+    httpPort = portOption "HTTP";
+    httpsPort = portOption "HTTPS";
     sites = mkOption {
       default = { };
       description = "Ordinary Caddy site blocks, composed in name order.";

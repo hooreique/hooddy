@@ -87,9 +87,13 @@ if command == "systemctl":
         raise AssertionError(arguments)
     if operation == "is-active":
         finish(0 if current["active"] else 3, "active" if current["active"] else "inactive")
-    if operation == "is-enabled":
-        finish(0 if current["enabled"] else 1, current.get("enabled_kind", "enabled") if current["enabled"] else "disabled")
     path = Path(os.environ["XDG_CONFIG_HOME"]) / "systemd/user" / unit
+    if operation == "is-enabled":
+        if not current["enabled"] and not path.exists():
+            finish(4, "not-found")
+        finish(0 if current["enabled"] else 1, current.get("enabled_kind", "enabled") if current["enabled"] else "disabled")
+    if operation in ["enable", "start", "reload", "reload-or-restart", "restart"] and not path.exists():
+        finish(5, f"Unit {unit} does not exist")
     if operation in ["stop", "disable"] and not path.exists() and not current["active"] and not current["enabled"]:
         finish(5, f"Unit {unit} does not exist")
     if operation == "enable":
@@ -98,7 +102,13 @@ if command == "systemctl":
         if "--now" in arguments:
             operation = "start"
     if operation == "disable":
-        current["enabled"] = False
+        runtime = "--runtime" in arguments
+        runtime_only = current.get("enabled_kind") == "enabled-runtime"
+        if runtime == runtime_only:
+            if current.pop("also_enabled_runtime", False) and not runtime:
+                current["enabled_kind"] = "enabled-runtime"
+            else:
+                current["enabled"] = False
         if "--now" in arguments:
             operation = "stop"
     if operation == "start":
@@ -131,6 +141,13 @@ elif command == "loginctl":
 elif command == "nix":
     operation = arguments[0]
     failure(operation)
+    if operation == "flake":
+        assert arguments[1] == "lock", arguments
+        output = Path(arguments[arguments.index("--output-lock-file") + 1])
+        assert output.is_absolute(), arguments
+        assert any(arg.startswith("path:") for arg in arguments), arguments
+        output.write_text('{"nodes":{"root":{}},"root":"root","version":7}\n')
+        finish()
     assert operation == "build", arguments
     assert "--no-update-lock-file" in arguments, arguments
     assert "--no-write-lock-file" in arguments, arguments

@@ -24,7 +24,7 @@ class SwitchTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.config = self.root / "config"
-        self.directory = self.config / "hooddy"
+        self.directory = self.root / ".config/hooddy"
         self.unit_dir = self.config / "systemd/user"
         self.runtime = self.root / "run"
         self.runtime.mkdir(mode=0o700)
@@ -43,6 +43,7 @@ class SwitchTests(unittest.TestCase):
                         HOODDY_TEST_STATE=str(self.state_file), PATH=f"{binaries}:{os.environ['PATH']}")
         self.env.pop("NOTIFY_SOCKET", None)
         self.generation_number = 0
+        self.directory.mkdir(parents=True)
         self.lock_text = '{"nodes":{},"root":"root","version":7}\n'
 
     def state(self):
@@ -61,11 +62,7 @@ class SwitchTests(unittest.TestCase):
             self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
 
-    def install(self, with_import=True):
-        self.cli("install")
-        if with_import:
-            config = self.directory / "Caddyfile"
-            config.write_text(config.read_text() + "\nimport generated/sites.caddy\n")
+    def configure(self):
         (self.directory / "flake.nix").write_text("{}\n")
         (self.directory / "flake.lock").write_text(self.lock_text)
         (self.directory / "untracked.nix").write_text("untracked configuration\n")
@@ -74,8 +71,9 @@ class SwitchTests(unittest.TestCase):
         self.generation_number += 1
         generation = self.root / f"generation-{self.generation_number}"
         (generation / "units").mkdir(parents=True)
-        manifest = {"protocolVersion": 1, "system": HOST_SYSTEM,
-                    "sites": "sites.caddy", "services": {}}
+        enabled = manifest_changes.get("enabled", True)
+        manifest = {"protocolVersion": 2, "system": HOST_SYSTEM, "enabled": enabled,
+                    "caddy": CADDY if enabled else None, "services": {}}
         for name, specification in (applications or {}).items():
             if isinstance(specification, str):
                 specification = {"description": specification}
@@ -88,16 +86,20 @@ class SwitchTests(unittest.TestCase):
                                              "healthCheck": specification.get("healthCheck")}
         manifest.update(manifest_changes)
         (generation / "manifest.json").write_text(json.dumps(manifest))
-        (generation / "sites.caddy").write_text(sites)
+        if enabled:
+            config = generation / "Caddyfile"
+            config.write_text("{\n admin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock\n}\n" + sites)
+            (generation / "units/hooddy.service").write_text(
+                "[Unit]\nDescription=Hooddy shared Caddy server\n\n"
+                "[Service]\nType=notify\nRuntimeDirectory=hooddy\n"
+                f"ExecStart={CADDY} run --config {config} --adapter caddyfile\n"
+                f"ExecReload={CADDY} reload --config {config} --adapter caddyfile\n\n"
+                "[Install]\nWantedBy=default.target\n")
         self.change_state(generation=str(generation))
         return generation
 
     def managed_files(self):
-        files = list(self.unit_dir.glob("hooddy-*.service"))
-        generated = self.directory / "generated/sites.caddy"
-        if generated.exists():
-            files.append(generated)
-        return {str(path.relative_to(self.config)): path.read_bytes() for path in files}
+        return {path.name: path.read_bytes() for path in self.unit_dir.glob("hooddy*.service")}
 
     def assert_no_journal(self):
         self.assertFalse((self.directory / ".switch/journal.json").exists())
@@ -106,65 +108,55 @@ class SwitchTests(unittest.TestCase):
         return any(path.is_symlink() and path.resolve() == generation
                    for path in (self.directory / ".switch").rglob("*"))
 
-    def test_requires_installation_and_enabled_linger(self):
-        self.assertIn("not installed", self.cli("switch", code=1).stderr)
-        self.install()
-        self.generation()
-        self.change_state(linger="no")
-        result = self.cli("switch", code=1)
-        self.assertIn("loginctl enable-linger", result.stderr)
+    def test_requires_the_flake_under_home(self):
+        misplaced = self.config / "hooddy"
+        misplaced.mkdir(parents=True)
+        (misplaced / "flake.nix").write_text("{}")
+        (misplaced / "flake.lock").write_text(self.lock_text)
+        self.cli("switch", code=1)
+        self.assertFalse(self.state()["builds"])
+        self.assertEqual(self.managed_files(), {})
+
+    def test_first_switch_enables_linger_and_starts_all_units(self):
+        self.configure()
+        generation = self.generation({"app": "App"}, "http://localhost:18080 {\n respond test\n}\n")
+        self.cli("switch")
+        self.assertEqual(self.state()["linger"], "yes")
+        for name in ("hooddy.service", "hooddy-app.service"):
+            state = self.state()["units"][name]
+            self.assertTrue(state["active"])
+            self.assertTrue(state["enabled"])
+            self.assertEqual((self.unit_dir / name).read_bytes(), (generation / "units" / name).read_bytes())
+        self.assertTrue(self.rooted(generation))
+        self.assert_no_journal()
+
+    def test_site_update_reloads_caddy_from_the_new_generation(self):
+        self.configure()
+        manual = self.directory / "Caddyfile"
+        manual.write_text("invalid handwritten configuration\n")
+        self.generation(sites="http://localhost:18080 {\n respond first\n}\n")
+        self.cli("switch")
+        new = self.generation(sites="http://localhost:18080 {\n respond second\n}\n")
+        self.cli("switch")
+        unit = self.state()["units"]["hooddy.service"]
+        self.assertEqual(unit["starts"], 1)
+        self.assertEqual(unit["stops"], 0)
+        self.assertEqual(unit["reloads"], 1)
+        self.assertEqual((self.unit_dir / "hooddy.service").read_bytes(),
+                         (new / "units/hooddy.service").read_bytes())
+        self.assertEqual(manual.read_text(), "invalid handwritten configuration\n")
+
+    def test_linger_permission_failure_leaves_no_running_units(self):
+        self.configure()
+        self.generation({"app": "App"})
+        self.change_state(fail_once=["loginctl:enable-linger"])
+        self.cli("switch", code=1)
         self.assertEqual(self.state()["linger"], "no")
-        self.assertEqual(self.state()["builds"], [])
-
-    def test_missing_import_is_actionable_without_editing_main_file(self):
-        self.install(with_import=False)
-        self.generation()
-        config = self.directory / "Caddyfile"
-        old = config.read_bytes()
-        result = self.cli("switch", code=1)
-        self.assertIn("import generated/sites.caddy", result.stderr)
-        self.assertEqual(config.read_bytes(), old)
         self.assertEqual(self.managed_files(), {})
-
-    def test_commented_import_does_not_authorize_generated_config(self):
-        self.install(with_import=False)
-        config = self.directory / "Caddyfile"
-        config.write_text(config.read_text() + "\n# import generated/sites.caddy\n")
-        self.generation({"app": "App"})
-        self.cli("switch", code=1)
-        self.assertEqual(self.managed_files(), {})
-
-    def test_unused_snippet_import_does_not_authorize_generated_config(self):
-        self.install(with_import=False)
-        config = self.directory / "Caddyfile"
-        config.write_text(config.read_text() + "\n(unused) {\n import generated/sites.caddy\n}\n")
-        self.generation({"app": "App"})
-        self.cli("switch", code=1)
-        self.assertEqual(self.managed_files(), {})
-
-    def test_empty_and_populated_generations_include_ordinary_sites(self):
-        self.install()
-        ordinary = self.directory / "sites.d/existing.caddy"
-        ordinary.write_text("http://ordinary.test:18080 {\n respond ordinary\n}\n")
-        main = (self.directory / "Caddyfile").read_bytes()
-        self.generation()
-        self.cli("switch")
-        generated = self.directory / "generated/sites.caddy"
-        self.assertEqual(generated.read_text(), "")
-        content = "http://generated.test:18081 {\n respond generated\n}\n"
-        self.generation({"example": "Example"}, sites=content)
-        self.cli("switch")
-        self.assertEqual(generated.read_text(), content)
-        self.assertEqual((self.directory / "Caddyfile").read_bytes(), main)
-        self.assertTrue(ordinary.exists())
-        self.assertTrue(self.unit("example")["active"])
-        self.assertTrue(self.unit("example")["enabled"])
-        self.assertTrue(self.state()["units"]["hooddy.service"]["active"])
-        self.assertFalse(self.state()["units"]["hooddy.service"]["enabled"])
         self.assert_no_journal()
 
     def test_snapshot_includes_local_files_and_preserves_lock(self):
-        self.install()
+        self.configure()
         generation = self.generation()
         self.cli("switch")
         builds = self.state()["builds"]
@@ -175,11 +167,37 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual((self.directory / "flake.lock").read_text(), self.lock_text)
         self.assertTrue(self.rooted(generation))
 
+    def test_first_switch_creates_a_lock_and_subsequent_switch_reuses_it(self):
+        self.configure()
+        lock = self.directory / "flake.lock"
+        lock.unlink()
+        self.generation()
+        self.cli("switch")
+        first_lock = lock.read_text()
+        self.assertEqual(json.loads(first_lock)["version"], 7)
+        self.cli("switch")
+        self.assertEqual(lock.read_text(), first_lock)
+        state = self.state()
+        self.assertEqual([build["lock"] for build in state["builds"]], [first_lock, first_lock])
+        self.assertEqual(sum(call[:3] == ["nix", "flake", "lock"] for call in state["calls"]), 1)
+
+    def test_first_lock_failure_does_not_activate(self):
+        self.configure()
+        lock = self.directory / "flake.lock"
+        lock.unlink()
+        self.generation()
+        self.change_state(fail_once=["nix:flake"])
+        self.cli("switch", code=1)
+        self.assertFalse(lock.exists())
+        self.assertFalse(self.state()["builds"])
+        self.assertEqual(self.managed_files(), {})
+        self.assertEqual(self.state()["linger"], "no")
+
     def test_rejects_protocol_platform_paths_and_health_urls_before_mutation(self):
-        self.install()
+        self.configure()
         definitions = [
-            {"protocolVersion": 2}, {"system": "unsupported-linux"},
-            {"sites": "../sites.caddy"},
+            {"protocolVersion": 1}, {"system": "unsupported-linux"},
+            {"caddy": "/tmp/caddy"}, {"enabled": "yes"},
             {"services": {"../bad": {"unit": "units/hooddy-bad.service", "healthCheck": None}}},
             {"services": {"app": {"unit": "../../etc/passwd", "healthCheck": None}}},
             {"services": {"app": {"unit": "units/hooddy-app.service", "healthCheck": {
@@ -192,41 +210,32 @@ class SwitchTests(unittest.TestCase):
                 self.generation({"app": "App"}, **changes)
                 self.cli("switch", code=1)
                 self.assertEqual(self.managed_files(), {})
-                self.assertFalse(self.state()["units"]["hooddy.service"]["active"])
+                self.assertFalse(any(unit["active"] for unit in self.state()["units"].values()))
 
-    def test_rejects_unmanaged_units_and_generated_file(self):
-        self.install()
+    def test_refuses_to_adopt_an_existing_legacy_or_application_unit(self):
+        self.configure()
         self.generation({"app": "App"})
-        unit = self.unit_dir / "hooddy-app.service"
-        unit.write_text("# Managed by hooddy.\noperator-owned\n")
-        self.cli("switch", code=1)
-        self.assertIn("operator-owned", unit.read_text())
-        unit.unlink()
-        generated = self.directory / "generated/sites.caddy"
-        generated.parent.mkdir(exist_ok=True)
-        generated.write_text("operator-owned\n")
-        self.cli("switch", code=1)
-        self.assertEqual(generated.read_text(), "operator-owned\n")
-        generated.unlink()
-        victim = self.root / "victim"
-        victim.write_text("untouched")
-        generated.symlink_to(victim)
-        self.cli("switch", code=1)
-        self.assertTrue(generated.is_symlink())
-        self.assertEqual(victim.read_text(), "untouched")
+        self.unit_dir.mkdir(parents=True)
+        for name in ("hooddy.service", "hooddy-app.service"):
+            with self.subTest(name=name):
+                unit = self.unit_dir / name
+                unit.write_text("# Managed by hooddy.\noperator-owned\n")
+                self.cli("switch", code=1)
+                self.assertIn("operator-owned", unit.read_text())
+                unit.unlink()
 
-    def test_rejects_symlinked_generated_directory(self):
-        self.install()
+    def test_refuses_symlinked_unit_directory(self):
+        self.configure()
         self.generation({"app": "App"})
         external = self.root / "external"
         external.mkdir()
-        (self.directory / "generated").symlink_to(external, target_is_directory=True)
+        self.unit_dir.parent.mkdir(parents=True)
+        self.unit_dir.symlink_to(external, target_is_directory=True)
         self.cli("switch", code=1)
         self.assertEqual(list(external.iterdir()), [])
-        self.assertFalse((self.unit_dir / "hooddy-app.service").exists())
 
     def test_rejects_unit_conflicts_and_dropins(self):
-        self.install()
+        self.configure()
         self.generation({"app": "App"})
         self.change_state(fragments={"hooddy-app.service": "/etc/systemd/user/hooddy-app.service"})
         self.cli("switch", code=1)
@@ -236,7 +245,7 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(self.managed_files(), {})
 
     def test_ownership_hash_detects_manual_edits_and_missing_files_reconcile(self):
-        self.install()
+        self.configure()
         self.generation({"app": "App"})
         self.cli("switch")
         path = self.unit_dir / "hooddy-app.service"
@@ -247,13 +256,13 @@ class SwitchTests(unittest.TestCase):
         path.unlink()
         self.cli("switch")
         self.assertEqual(path.read_bytes(), original)
-        generated = self.directory / "generated/sites.caddy"
-        generated.write_text("# local edit\n")
+        caddy_unit = self.unit_dir / "hooddy.service"
+        caddy_unit.write_text("# local edit\n")
         self.cli("switch", code=1)
-        self.assertEqual(generated.read_text(), "# local edit\n")
+        self.assertEqual(caddy_unit.read_text(), "# local edit\n")
 
     def test_managed_file_changed_during_validation_is_preserved(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         self.generation({"app": "After"})
@@ -267,7 +276,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_lock_changed_during_evaluation_is_not_activated_or_overwritten(self):
-        self.install()
+        self.configure()
         self.generation({"app": "App"})
         lock = self.directory / "flake.lock"
         changed = self.lock_text + "\n"
@@ -278,7 +287,7 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(self.managed_files(), {})
 
     def test_add_change_remove_and_reconcile_without_restarting_healthy_units(self):
-        self.install()
+        self.configure()
         first = self.generation({"keep": "Keep", "change": "Before", "remove": "Remove"})
         self.cli("switch")
         second = self.generation({"keep": "Keep", "change": "After", "added": "Added"})
@@ -304,34 +313,49 @@ class SwitchTests(unittest.TestCase):
         self.assertTrue(self.rooted(first))
         self.assertTrue(self.rooted(second))
 
-    def test_caddy_enablement_is_preserved(self):
-        self.install()
-        self.cli("start")
+    def test_repeated_switch_restores_caddy_enablement_and_activity(self):
+        self.configure()
         self.generation()
         self.cli("switch")
+        state = self.state()
+        state["units"]["hooddy.service"].update(active=False, enabled=False)
+        self.state_file.write_text(json.dumps(state))
+        self.cli("switch")
         self.assertTrue(self.state()["units"]["hooddy.service"]["enabled"])
+        self.assertTrue(self.state()["units"]["hooddy.service"]["active"])
 
-    def test_full_caddy_validation_detects_invalid_existing_and_generated_sites(self):
-        self.install()
-        self.generation({"app": "App"})
-        existing = self.directory / "sites.d/invalid.caddy"
-        existing.write_text("http://existing.test:18080 {\n unknown_directive\n}\n")
+    def test_changed_systemd_unit_directory_cannot_redirect_teardown(self):
+        self.configure()
+        old = self.generation({"app": "App"})
+        self.cli("switch")
+        units = self.managed_files()
+        other = self.root / "other"
+        self.env["XDG_CONFIG_HOME"] = str(other)
+        self.generation(enabled=False)
         self.cli("switch", code=1)
+        self.assertEqual(self.managed_files(), units)
+        self.assertTrue(self.rooted(old))
+        self.assertTrue(self.unit("app")["active"])
+        self.assertFalse((other / "systemd/user").exists())
+        self.env["XDG_CONFIG_HOME"] = str(self.config)
+        self.cli("switch")
         self.assertEqual(self.managed_files(), {})
-        existing.unlink()
+
+    def test_validates_caddyfile_from_the_generation(self):
+        self.configure()
         self.generation({"app": "App"}, "http://app.test:18080 {\n unknown_directive\n}\n")
         self.cli("switch", code=1)
         self.assertEqual(self.managed_files(), {})
 
     def test_unit_validation_failure_precedes_mutation(self):
-        self.install()
+        self.configure()
         self.generation({"app": "App"})
         self.change_state(fail_once=["systemd-analyze:verify"])
         self.cli("switch", code=1)
         self.assertEqual(self.managed_files(), {})
 
     def test_unit_contract_rejects_nonstore_executables_and_extra_install_links(self):
-        self.install()
+        self.configure()
         for change in [lambda text: text.replace(CADDY, "/bin/sh"),
                        lambda text: text.replace("WantedBy=default.target", "WantedBy=default.target\nAlias=other.service")]:
             with self.subTest(change=change):
@@ -362,7 +386,7 @@ class SwitchTests(unittest.TestCase):
             worker.join()
 
     def test_health_success_and_failure_restore_previous_files_and_states(self):
-        self.install()
+        self.configure()
         with self.health_server() as url:
             first = self.generation({"app": {"description": "Before", "healthCheck": {
                 "url": url, "timeoutSeconds": 1}}})
@@ -382,7 +406,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_rollback_restores_inactive_disabled_service_state(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         state = self.state()
@@ -399,7 +423,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_rollback_restores_runtime_only_enablement(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         state = self.state()
@@ -415,7 +439,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_health_does_not_follow_redirects(self):
-        self.install()
+        self.configure()
         with self.health_server() as good:
             with self.health_server(status=302, redirect=good) as url:
                 self.generation({"app": {"healthCheck": {"url": url, "timeoutSeconds": 1}}})
@@ -424,7 +448,7 @@ class SwitchTests(unittest.TestCase):
         self.assertFalse(self.unit("app")["active"])
 
     def test_first_activation_failure_restores_absence_and_stopped_caddy(self):
-        self.install()
+        self.configure()
         self.generation({"app": "App"}, "http://app.test:18080 {\n respond app\n}\n")
         self.change_state(fail_once=["systemctl:reload-or-restart:hooddy.service"])
         self.cli("switch", code=1)
@@ -435,7 +459,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_caddy_reload_failure_restores_previous_generation(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         previous = self.managed_files()
@@ -447,7 +471,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_rollback_failure_keeps_roots_and_recovers_before_next_switch(self):
-        self.install()
+        self.configure()
         first = self.generation({"app": "Before"})
         self.cli("switch")
         second = self.generation({"app": "After"})
@@ -463,7 +487,7 @@ class SwitchTests(unittest.TestCase):
         self.assertIn("After", (self.unit_dir / "hooddy-app.service").read_text())
 
     def test_failure_before_new_units_exist_can_roll_back(self):
-        self.install()
+        self.configure()
         self.generation({"existing": "Before"})
         self.cli("switch")
         previous = self.managed_files()
@@ -476,7 +500,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_interrupted_activation_recovers_before_accepting_next_switch(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         previous = self.managed_files()
@@ -493,7 +517,7 @@ class SwitchTests(unittest.TestCase):
         self.assert_no_journal()
 
     def test_interrupted_recovery_preserves_manual_edits_and_recovery_roots(self):
-        self.install()
+        self.configure()
         first = self.generation({"app": "Before"})
         self.cli("switch")
         second = self.generation({"app": "After"})
@@ -510,7 +534,7 @@ class SwitchTests(unittest.TestCase):
         self.assertTrue(self.rooted(second))
 
     def test_recovery_refuses_new_unit_conflict(self):
-        self.install()
+        self.configure()
         self.generation({"app": "Before"})
         self.cli("switch")
         self.generation({"app": "After"})
@@ -523,29 +547,22 @@ class SwitchTests(unittest.TestCase):
         self.assertNotIn(["systemctl", "--user", "start", "hooddy-app.service"],
                          self.state()["calls"][before:])
 
-    def test_interrupted_first_rollback_recovers_its_temporary_empty_import(self):
-        self.install(with_import=False)
-        self.cli("start")
-        config = self.directory / "Caddyfile"
-        config.write_text(config.read_text() + "\nimport generated/sites.caddy\n")
-        self.generation({"app": "App"})
+    def test_crash_during_first_activation_rolls_back_before_the_next_build(self):
+        self.configure()
+        candidate = self.generation({"app": "App"})
         self.change_state(interrupt_once=["systemctl:daemon-reload"])
         self.assertNotEqual(self.cli("switch", code=None).returncode, 0)
-        self.change_state(interrupt_once=["systemctl:reload-or-restart:hooddy.service"])
-        self.assertNotEqual(self.cli("restart", code=None).returncode, 0)
-        generated = self.directory / "generated/sites.caddy"
-        self.assertEqual(generated.read_text(), "")
         self.assertTrue((self.directory / ".switch/journal.json").exists())
         self.change_state(fail_once=["nix:build"])
         self.cli("switch", code=1)
         self.assertEqual(self.managed_files(), {})
-        self.assertTrue(self.state()["units"]["hooddy.service"]["active"])
-        self.assertTrue(self.state()["units"]["hooddy.service"]["enabled"])
+        self.assertFalse(self.rooted(candidate))
+        self.assertFalse(any(unit["active"] or unit["enabled"] for unit in self.state()["units"].values()))
         self.assert_no_journal()
 
     def test_switch_holds_existing_lock_through_build_and_activation(self):
         import fcntl
-        self.install()
+        self.configure()
         self.generation()
         with (self.directory / ".lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -563,17 +580,64 @@ class SwitchTests(unittest.TestCase):
                     process.kill()
                     process.communicate()
 
-    def test_uninstall_refuses_until_services_removed(self):
-        self.install()
+    def test_disabled_generation_removes_services_and_roots_but_preserves_user_data(self):
+        self.configure()
+        first = self.generation({"app": "App"})
+        self.cli("switch")
+        second = self.generation({"app": "Updated"})
+        self.cli("switch")
+        cert = self.root / "data/caddy/certificates/example.crt"
+        cert.parent.mkdir(parents=True)
+        cert.write_text("keep")
+        disabled = self.generation(enabled=False)
+        for _ in range(2):
+            self.cli("switch")
+            self.assertEqual(self.managed_files(), {})
+            self.assertFalse(any(unit["active"] or unit["enabled"] for unit in self.state()["units"].values()))
+            self.assertFalse(any(self.rooted(generation) for generation in (first, second, disabled)))
+            self.assertEqual(self.state()["linger"], "yes")
+            self.assertEqual(cert.read_text(), "keep")
+            self.assertEqual((self.directory / "flake.lock").read_text(), self.lock_text)
+            self.assert_no_journal()
+        self.generation({"new": "New"})
+        self.cli("switch")
+        self.assertTrue(self.unit("new")["active"])
+
+    def test_initial_disabled_switch_does_not_enable_linger(self):
+        self.configure()
+        self.generation(enabled=False)
+        self.cli("switch")
+        self.assertEqual(self.managed_files(), {})
+        self.assertEqual(self.state()["linger"], "no")
+
+    def test_disable_clears_persistent_and_runtime_unit_links(self):
+        self.configure()
         self.generation({"app": "App"})
         self.cli("switch")
-        self.cli("uninstall", code=1)
-        self.assertTrue((self.unit_dir / "hooddy.service").exists())
-        self.assertTrue(self.unit("app")["active"])
-        self.generation()
+        state = self.state()
+        state["units"]["hooddy-app.service"]["also_enabled_runtime"] = True
+        state["units"]["hooddy.service"]["enabled_kind"] = "enabled-runtime"
+        self.state_file.write_text(json.dumps(state))
+        self.generation(enabled=False)
         self.cli("switch")
-        self.cli("uninstall")
-        self.assertFalse((self.unit_dir / "hooddy.service").exists())
+        for name in ("hooddy-app.service", "hooddy.service"):
+            self.assertFalse(self.state()["units"][name]["enabled"])
+        self.assertEqual(self.managed_files(), {})
+
+    def test_failed_disable_rolls_back_running_units(self):
+        self.configure()
+        old = self.generation({"app": "App"})
+        self.cli("switch")
+        previous = self.managed_files()
+        self.generation(enabled=False)
+        self.change_state(fail_once=["systemctl:daemon-reload"])
+        self.cli("switch", code=1)
+        self.assertEqual(self.managed_files(), previous)
+        self.assertTrue(self.rooted(old))
+        for name in ("hooddy.service", "hooddy-app.service"):
+            self.assertTrue(self.state()["units"][name]["active"])
+            self.assertTrue(self.state()["units"][name]["enabled"])
+        self.assert_no_journal()
 
 
 if __name__ == "__main__":
