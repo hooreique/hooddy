@@ -73,8 +73,7 @@ in
         specialArgs = specialArgs // { inherit pkgs; };
       };
       inherit (evaluated) config options;
-      sites = config.hooddy.sites;
-      services = config.hooddy.services;
+      inherit (config.hooddy) enable sites services httpPort httpsPort;
       names = builtins.attrNames sites ++ builtins.attrNames services;
       siteAddresses = lib.concatMap (name: literalAddresses sites.${name}.config) (builtins.attrNames sites);
       # Public application options remain application-owned. These common
@@ -90,24 +89,58 @@ in
         { ok = duplicates domains == [ ]; message = "duplicate application domains: ${lib.concatStringsSep ", " (duplicates domains)}"; }
         { ok = duplicates siteAddresses == [ ]; message = "duplicate literal Caddy site addresses: ${lib.concatStringsSep ", " (duplicates siteAddresses)}"; }
       ];
-      validate = value: lib.foldr (assertion: next: require assertion.ok assertion.message next) value assertions;
+      validate = value: lib.foldr (assertion: next: require assertion.ok assertion.message next) value (lib.optionals enable assertions);
       siteText = lib.concatMapStrings (name: sites.${name}.config + "\n") (builtins.attrNames sites);
+      caddy = lib.getExe pkgs.caddy;
+      globalOptions = [ "\tadmin unix/{$XDG_RUNTIME_DIR}/hooddy/admin.sock" ]
+        ++ lib.optional (httpPort != null) "\thttp_port ${toString httpPort}"
+        ++ lib.optional (httpsPort != null) "\thttps_port ${toString httpsPort}";
+      caddyfile = pkgs.writeText "hooddy-Caddyfile" ''
+        {
+        ${lib.concatStringsSep "\n" globalOptions}
+        }
+
+        ${siteText}
+      '';
+      caddyUnit = pkgs.writeText "hooddy.service" ''
+        [Unit]
+        Description=Hooddy shared Caddy server
+        After=network.target
+
+        [Service]
+        Type=notify
+        RuntimeDirectory=hooddy
+        RuntimeDirectoryMode=0700
+        ExecStart=${caddy} run --config ${caddyfile} --adapter caddyfile
+        ExecReload=${caddy} reload --config ${caddyfile} --adapter caddyfile
+        Restart=on-failure
+        RestartSec=2s
+        TimeoutStopSec=30s
+
+        [Install]
+        WantedBy=default.target
+      '';
       manifest = {
-        protocolVersion = 1;
+        protocolVersion = 2;
         inherit system;
-        sites = "sites.caddy";
-        services = lib.mapAttrs (name: service: {
+        enabled = enable;
+        caddy = if enable then caddy else null;
+        services = lib.optionalAttrs enable (lib.mapAttrs (name: service: {
           unit = "units/hooddy-${name}.service";
           inherit (service) healthCheck;
-        }) services;
+        }) services);
       };
       activationPackage = pkgs.runCommand "hooddy-generation" { } ''
-        mkdir -p "$out/units"
-        cp ${pkgs.writeText "hooddy-sites.caddy" siteText} "$out/sites.caddy"
+        mkdir -p "$out"
         cp ${pkgs.writeText "hooddy-manifest.json" (builtins.toJSON manifest)} "$out/manifest.json"
-        ${lib.concatMapStringsSep "\n" (name: ''
-          cp ${pkgs.writeText "hooddy-${name}.service" services.${name}.unit} "$out/units/hooddy-${name}.service"
-        '') (builtins.attrNames services)}
+        ${lib.optionalString enable ''
+          mkdir -p "$out/units"
+          cp ${caddyfile} "$out/Caddyfile"
+          cp ${caddyUnit} "$out/units/hooddy.service"
+          ${lib.concatMapStringsSep "\n" (name: ''
+            cp ${pkgs.writeText "hooddy-${name}.service" services.${name}.unit} "$out/units/hooddy-${name}.service"
+          '') (builtins.attrNames services)}
+        ''}
       '';
     in
     require (builtins.elem system supportedSystems) "unsupported system ${system}; expected x86_64-linux or aarch64-linux" (

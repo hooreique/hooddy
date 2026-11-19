@@ -1,10 +1,11 @@
-"""Protocol v1 activation. Called by hooddy.sh while its flock is held.
+"""Activate a locked hooddy protocol v2 generation.
 
 All service-manager access stays at the subprocess boundary so activation and
 crash recovery can be tested without touching a user's actual services.
 """
 
 import base64
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -100,17 +101,6 @@ def service_name(name):
     return f"hooddy-{name}.service"
 
 
-def has_generated_import(text):
-    depth = 0
-    for line in text.splitlines():
-        if depth == 0 and re.fullmatch(r'\s*import\s+(?:generated/sites\.caddy|"generated/sites\.caddy")\s*(?:#.*)?', line):
-            return True
-        # Ignore braces in strings, environment expansions and comments.
-        structural = re.sub(r'"(?:\\.|[^"\\])*"|\{\$[^}]*\}|#.*', "", line)
-        depth += structural.count("{") - structural.count("}")
-    return False
-
-
 def valid_health(health):
     if health is None:
         return
@@ -166,14 +156,23 @@ def validate_unit(text, name):
 def generation(path):
     path = path.resolve(strict=True)
     manifest = read_json(path / "manifest.json")
-    if not isinstance(manifest, dict) or type(manifest.get("protocolVersion")) is not int or manifest["protocolVersion"] != 1:
-        raise ActivationError("incompatible generation protocol version (CLI supports 1)")
+    if not isinstance(manifest, dict) or type(manifest.get("protocolVersion")) is not int or manifest["protocolVersion"] != 2:
+        raise ActivationError("incompatible generation protocol version (CLI supports 2)")
     system = {"x86_64": "x86_64-linux", "aarch64": "aarch64-linux"}.get(platform.machine())
     if manifest.get("system") != system or system is None:
         raise ActivationError(f"generation system {manifest.get('system')} does not match host {system}")
-    if manifest.get("sites") != "sites.caddy" or not isinstance(manifest.get("services"), dict):
-        raise ActivationError("invalid generation manifest paths or services")
-    files = {"generated/sites.caddy": read_regular(path / "sites.caddy")}
+    if type(manifest.get("enabled")) is not bool or not isinstance(manifest.get("services"), dict):
+        raise ActivationError("invalid generation manifest")
+    files = {}
+    if manifest["enabled"]:
+        caddy = manifest.get("caddy")
+        if not isinstance(caddy, str) or not re.fullmatch(r"/nix/store/[a-z0-9]{32}-[^/\s]+/bin/caddy", caddy):
+            raise ActivationError("invalid Caddy executable in generation")
+        read_regular(path / "Caddyfile")
+        files["hooddy.service"] = read_regular(path / "units/hooddy.service")
+        validate_unit(files["hooddy.service"].decode(), "hooddy.service")
+    elif manifest["services"] or manifest.get("caddy") is not None:
+        raise ActivationError("disabled generation declares services or Caddy")
     for name, definition in manifest["services"].items():
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", name):
             raise ActivationError(f"invalid managed name: {name}")
@@ -192,8 +191,8 @@ def generation(path):
 
 class Switch:
     def __init__(self):
-        self.config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "hooddy"
-        self.units = self.config.parent / "systemd/user"
+        self.config = Path.home() / ".config/hooddy"
+        self.units = Path(os.environ.get("XDG_CONFIG_HOME") or self.config.parent) / "systemd/user"
         self.state = self.config / ".switch"
         self.roots = self.state / "roots"
         self.current = self.state / "current.json"
@@ -201,9 +200,7 @@ class Switch:
         plain_parents(self.state)
 
     def destination(self, key):
-        if key == "generated/sites.caddy":
-            return self.config / key
-        if re.fullmatch(r"hooddy-[a-zA-Z0-9][a-zA-Z0-9_-]*\.service", key):
+        if key == "hooddy.service" or re.fullmatch(r"hooddy-[a-zA-Z0-9][a-zA-Z0-9_-]*\.service", key):
             return self.units / key
         raise ActivationError(f"invalid managed destination: {key}")
 
@@ -216,18 +213,9 @@ class Switch:
         if target is None:
             remove(destination)
             return
-        temporary = self.roots / f".{name}-new"
-        if exists(temporary):
-            if not temporary.is_symlink():
-                raise ActivationError(f"unexpected GC root: {temporary}")
-            remove(temporary)
-        run("nix-store", "--add-root", str(temporary), "--indirect", "-r", target)
-        # Register the final path as well: indirect roots track the link's name.
-        if exists(destination):
-            remove(destination)
+        # Nix replaces the existing symlink and registers this exact root path.
         run("nix-store", "--add-root", str(destination), "--indirect", "-r", target)
         sync_dir(self.roots)
-        remove(temporary)
 
     def load_current(self):
         if not exists(self.current):
@@ -236,12 +224,18 @@ class Switch:
         if not isinstance(recorded, dict) or not isinstance(recorded.get("generation"), str):
             raise ActivationError("invalid current generation record")
         actual, _ = generation(Path(recorded["generation"]))
+        self.check_unit_directory(recorded)
+        actual["unitDirectory"] = str(self.units)
         if actual != recorded:
             raise ActivationError("current generation record disagrees with immutable manifest")
         root = self.roots / "current"
         if not root.is_symlink() or root.resolve() != Path(recorded["generation"]):
             raise ActivationError("current generation GC root is missing or inconsistent")
         return recorded
+
+    def check_unit_directory(self, record):
+        if record.get("unitDirectory") != str(self.units):
+            raise ActivationError(f"use the systemd unit directory from the previous switch: {record.get('unitDirectory')}")
 
     def systemctl(self, *args, check=True):
         return run("systemctl", "--user", *args, check=check)
@@ -280,15 +274,12 @@ class Switch:
             if data is not None and (key not in previous or digest(data) != previous[key]):
                 raise ActivationError(f"refusing unmanaged or unexpectedly changed file: {destination}")
             snapshots[key] = base64.b64encode(data).decode() if data is not None else None
-        names = set(old["manifest"]["services"] if old else {}) | set(candidate["manifest"]["services"])
         states = {}
-        for name in sorted(names):
-            unit = service_name(name)
+        for unit in snapshots:
             self.unit_conflicts(unit, previous)
             states[unit] = self.status(unit)
             if unit not in previous and (states[unit]["active"] or states[unit]["enabled"] in {"enabled", "enabled-runtime"}):
                 raise ActivationError(f"unmanaged service state conflicts with {unit}")
-        states["hooddy.service"] = self.status("hooddy.service")
         return snapshots, states
 
     def copy_config(self, destination):
@@ -296,23 +287,15 @@ class Switch:
         # generations. All application source files, including untracked ones,
         # remain in the snapshot.
         def ignore(directory, names):
-            return {".switch", ".lock", "caddy"} & set(names) if Path(directory) == self.config else set()
+            return {".switch", ".lock"} & set(names) if Path(directory) == self.config else set()
         shutil.copytree(self.config, destination, symlinks=True, ignore=ignore)
 
-    def validate(self, snapshot, candidate, files):
-        caddyfile = snapshot / "Caddyfile"
-        text = read_regular(caddyfile).decode()
-        if not has_generated_import(text):
-            raise ActivationError(f"add an explicit 'import generated/sites.caddy' line to {self.config / 'Caddyfile'}")
-        generated = snapshot / "generated/sites.caddy"
-        atomic_write(generated, files["generated/sites.caddy"], 0o644)
-        executable = self.config / "caddy/bin/caddy"
-        if not executable.is_file():
-            raise ActivationError("installed Caddy executable is missing; reinstall hooddy")
-        run(str(executable), "validate", "--config", str(caddyfile), "--adapter", "caddyfile")
-        units = [str(Path(candidate["generation"]) / "units" / service_name(name))
-                 for name in sorted(candidate["manifest"]["services"])]
-        if units:
+    def validate(self, candidate):
+        if candidate["manifest"]["enabled"]:
+            generation_dir = Path(candidate["generation"])
+            run(candidate["manifest"]["caddy"], "validate", "--config",
+                str(generation_dir / "Caddyfile"), "--adapter", "caddyfile")
+            units = [str(generation_dir / "units" / unit) for unit in sorted(candidate["files"])]
             run("systemd-analyze", "--user", "verify", *units)
 
     def healthy(self, name, health):
@@ -356,8 +339,6 @@ class Switch:
                 allowed = {journal["candidate"]["files"].get(key)}
                 if original is not None:
                     allowed.add(digest(base64.b64decode(original)))
-                if key == "generated/sites.caddy" and journal.get("recoveryEmptySite") and original is None:
-                    allowed.add(digest(b""))
                 if digest(read_regular(destination)) not in allowed:
                     raise ActivationError(f"refusing unexpectedly changed file during activation/recovery: {destination}")
 
@@ -367,8 +348,12 @@ class Switch:
             self.systemctl("stop", unit)
 
     def disable_if_enabled(self, unit):
-        if self.systemctl("is-enabled", unit, check=False).stdout.strip() in {"enabled", "enabled-runtime"}:
+        state = self.systemctl("is-enabled", unit, check=False).stdout.strip()
+        if state == "enabled":
             self.systemctl("disable", unit)
+            state = self.systemctl("is-enabled", unit, check=False).stdout.strip()
+        if state == "enabled-runtime":
+            self.systemctl("disable", "--runtime", unit)
 
     def restore(self, journal):
         old = journal["old"]
@@ -384,8 +369,7 @@ class Switch:
         # be overwritten just because a previous activation was interrupted.
         self.check_transaction_files(journal)
         for unit in journal["states"]:
-            if unit != "hooddy.service":
-                self.unit_conflicts(unit, journal["snapshots"])
+            self.unit_conflicts(unit, journal["snapshots"])
         self.phase(journal, "rolling-back")
         for unit in journal["changed"]:
             attempt(f"stop {unit}", lambda unit=unit: self.stop_if_running(unit))
@@ -399,9 +383,9 @@ class Switch:
                     atomic_write(self.destination(key), base64.b64decode(original), 0o644)
             attempt(f"restore {key}", restore_file)
         attempt("daemon-reload", lambda: self.systemctl("daemon-reload"))
-        for unit, state in journal["states"].items():
-            if unit == "hooddy.service":
-                continue
+        # Restore backends before Caddy accepts requests again.
+        for unit in sorted(journal["states"], key=lambda name: name == "hooddy.service"):
+            state = journal["states"][unit]
             if state["enabled"] in {"enabled", "enabled-runtime"}:
                 if state["enabled"] == "enabled-runtime":
                     attempt(f"clear persistent enablement of {unit}", lambda unit=unit: self.disable_if_enabled(unit))
@@ -410,26 +394,10 @@ class Switch:
             elif unit in (old["files"] if old else {}):
                 attempt(f"disable {unit}", lambda unit=unit: self.disable_if_enabled(unit))
             if state["active"]:
-                attempt(f"start {unit}", lambda unit=unit: self.systemctl("start", unit))
+                action = "reload-or-restart" if unit == "hooddy.service" else "start"
+                attempt(f"restore active {unit}", lambda unit=unit: self.systemctl(action, unit))
             else:
                 attempt(f"stop {unit}", lambda unit=unit: self.stop_if_running(unit))
-        caddy = journal["states"]["hooddy.service"]
-        if caddy["active"]:
-            # First activation may have introduced the imported file. Preserve
-            # pre-switch absence on disk after restoring the running config.
-            site = self.config / "generated/sites.caddy"
-            absent = not exists(site)
-            try:
-                if absent:
-                    journal["recoveryEmptySite"] = True
-                    write_json(self.journal, journal)
-                    atomic_write(site, b"", 0o644)
-                attempt("restore Caddy configuration", lambda: self.systemctl("reload-or-restart", "hooddy.service"))
-            finally:
-                if absent:
-                    remove(site)
-        else:
-            attempt("stop Caddy", lambda: self.systemctl("stop", "hooddy.service"))
         if failures:
             journal["recoveryErrors"] = failures
             write_json(self.journal, journal)
@@ -442,74 +410,98 @@ class Switch:
             self.root("current", None)
             remove(self.current)
         self.root("previous", journal.get("previous"))
+        self.finish_transaction()
+
+    def finish_transaction(self, disabled=False):
+        if disabled:
+            remove(self.current)
+            self.root("current", None)
+            self.root("previous", None)
+        for name in ["candidate", "transaction-old", "transaction-previous"]:
+            self.root(name, None)
         remove(self.journal)
-        self.root("candidate", None)
-        self.root("transaction-old", None)
-        self.root("transaction-previous", None)
 
     def recover(self):
         if not exists(self.journal):
             return
         journal = read_json(self.journal)
-        if journal.get("version") != 1:
+        if journal.get("version") != 2:
             raise ActivationError("unsupported recovery journal; keep generation roots for manual recovery")
+        self.check_unit_directory(journal["candidate"])
         if journal.get("phase") == "committed":
             # Commit is durable. A crash during GC-root cleanup must not undo it.
-            self.load_current()
-            remove(self.journal)
-            self.root("candidate", None)
-            self.root("transaction-old", None)
-            self.root("transaction-previous", None)
+            enabled = journal["candidate"]["manifest"]["enabled"]
+            if enabled:
+                self.load_current()
+            self.finish_transaction(disabled=not enabled)
             return
         print("hooddy: recovering interrupted switch", file=sys.stderr)
         self.restore(journal)
 
     def switch(self):
-        linger = run("loginctl", "show-user", run("id", "-un").stdout.strip(), "--property=Linger", "--value").stdout.strip()
-        if linger != "yes":
-            raise ActivationError("switch requires enabled linger; run loginctl enable-linger $(id -un)")
+        read_regular(self.config / "flake.nix")
         old = self.load_current()
         self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not exists(self.config / "flake.lock"):
-            raise ActivationError(f"missing flake.lock; run nix flake lock in {self.config} before switching")
-        lock = read_regular(self.config / "flake.lock")
-        read_regular(self.config / "flake.nix")
+        lock_file = self.config / "flake.lock"
+        lock = read_regular(lock_file) if exists(lock_file) else None
         journal = None
         with tempfile.TemporaryDirectory(prefix="hooddy-switch-") as temporary:
             snapshot = Path(temporary) / "config"
             self.copy_config(snapshot)
+            if lock is None:
+                # Publish the first lock atomically without replacing a lock
+                # another editor or Nix invocation created in the meantime.
+                with tempfile.TemporaryDirectory(dir=self.state) as staging:
+                    generated = Path(staging) / "flake.lock"
+                    run("nix", "flake", "lock", "--output-lock-file", str(generated), f"path:{snapshot}")
+                    lock = read_regular(generated)
+                    os.link(generated, lock_file)
+                    sync_dir(self.config)
+                    atomic_write(snapshot / "flake.lock", lock)
             if read_regular(snapshot / "flake.lock") != lock:
                 raise ActivationError("flake.lock changed while snapshotting configuration")
             try:
                 self.root("candidate", None)
-                self.roots.mkdir(parents=True, exist_ok=True)
                 run("nix", "build", "--no-update-lock-file", "--no-write-lock-file", "--out-link",
                     str(self.roots / "candidate"), f"path:{snapshot}#hooddyConfigurations.default.activationPackage")
                 candidate, files = generation(self.roots / "candidate")
-                if read_regular(snapshot / "flake.lock") != lock or read_regular(self.config / "flake.lock") != lock:
+                candidate["unitDirectory"] = str(self.units)
+                if read_regular(snapshot / "flake.lock") != lock or read_regular(lock_file) != lock:
                     raise ActivationError("flake.lock changed during evaluation")
                 snapshots, states = self.ownership(old, candidate)
-                self.validate(snapshot, candidate, files)
+                self.validate(candidate)
                 # Recheck after slow validation, before recording the transaction.
                 if self.ownership(old, candidate) != (snapshots, states):
                     raise ActivationError("managed files or service states changed during validation")
                 old_files = old["files"] if old else {}
                 changed = sorted(key for key in old_files.keys() | files.keys()
-                                 if key != "generated/sites.caddy" and
-                                 (old_files.get(key) != candidate["files"].get(key) or snapshots.get(key) is None))
+                                 if old_files.get(key) != candidate["files"].get(key) or snapshots.get(key) is None)
                 previous = self.roots / "previous"
                 if exists(previous) and not previous.is_symlink():
                     raise ActivationError(f"unexpected GC root: {previous}")
-                journal = {"version": 1, "old": old, "candidate": candidate, "snapshots": snapshots,
+                enabled = candidate["manifest"]["enabled"]
+                if enabled:
+                    user = run("id", "-un").stdout.strip()
+                    linger = run("loginctl", "show-user", user, "--property=Linger", "--value").stdout.strip()
+                    if linger == "no":
+                        run("loginctl", "enable-linger", user)
+                    elif linger != "yes":
+                        raise ActivationError(f"unexpected linger state: {linger}")
+                journal = {"version": 2, "old": old, "candidate": candidate, "snapshots": snapshots,
                            "states": states, "changed": changed,
                            "previous": str(previous.resolve()) if previous.is_symlink() else None}
+                self.phase(journal, "preparing")
                 if old:
                     self.root("transaction-old", old["generation"])
                 if journal["previous"]:
                     self.root("transaction-previous", journal["previous"])
                 self.phase(journal, "stopping-services")
                 for unit in changed:
-                    if unit in old_files:
+                    # A new Caddyfile can be gracefully reloaded after systemd
+                    # reads the new ExecReload. A new executable needs a start.
+                    reload_caddy = (unit == "hooddy.service" and enabled and old
+                                    and old["manifest"]["caddy"] == candidate["manifest"]["caddy"])
+                    if unit in old_files and not reload_caddy:
                         self.stop_if_running(unit)
                     if unit not in files:
                         self.disable_if_enabled(unit)
@@ -525,27 +517,26 @@ class Switch:
                     self.systemctl("enable", unit)
                     self.systemctl("start", unit)
                     self.healthy(name, definition["healthCheck"])
-                self.phase(journal, "reloading-caddy")
-                self.check_transaction_files(journal)
-                atomic_write(self.config / "generated/sites.caddy", files["generated/sites.caddy"], 0o644)
-                self.systemctl("reload-or-restart", "hooddy.service")
-                if self.systemctl("is-active", "hooddy.service", check=False).returncode:
-                    raise ActivationError("Caddy is not active after switch")
+                if enabled:
+                    self.phase(journal, "reloading-caddy")
+                    self.check_transaction_files(journal)
+                    self.systemctl("enable", "hooddy.service")
+                    self.systemctl("reload-or-restart", "hooddy.service")
+                    if self.systemctl("is-active", "hooddy.service", check=False).returncode:
+                        raise ActivationError("Caddy is not active after switch")
                 self.phase(journal, "committing")
                 self.check_transaction_files(journal)
                 for unit in changed:
                     if unit not in files:
                         remove(self.destination(unit))
                 self.systemctl("daemon-reload")
-                if old and old["generation"] != candidate["generation"]:
-                    self.root("previous", old["generation"])
-                self.root("current", candidate["generation"])
-                write_json(self.current, candidate)
+                if enabled:
+                    if old and old["generation"] != candidate["generation"]:
+                        self.root("previous", old["generation"])
+                    self.root("current", candidate["generation"])
+                    write_json(self.current, candidate)
                 self.phase(journal, "committed")
-                remove(self.journal)
-                self.root("candidate", None)
-                self.root("transaction-old", None)
-                self.root("transaction-previous", None)
+                self.finish_transaction(disabled=not enabled)
             except (ActivationError, OSError, ValueError) as error:
                 if journal is not None and exists(self.journal) and journal.get("phase") != "committed":
                     try:
@@ -555,7 +546,10 @@ class Switch:
                 elif journal is None:
                     self.root("candidate", None)
                 raise
-        print("hooddy: switched to " + candidate["generation"])
+        if enabled:
+            print("hooddy: switched to " + candidate["generation"])
+        else:
+            print("hooddy: services removed")
 
 
 def main():
@@ -565,16 +559,12 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     try:
         manager = Switch()
-        manager.recover()
-        command = sys.argv[1]
-        if command == "switch":
+        # Keep a stable lock inode even when a disabled switch drops all roots.
+        lock_fd = os.open(manager.config / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(lock_fd, "r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            manager.recover()
             manager.switch()
-        elif command == "check-uninstall":
-            current = manager.load_current()
-            if current and current["manifest"]["services"]:
-                raise ActivationError("switch-managed services remain; switch to a configuration with no app services before uninstall")
-        elif command != "recover":
-            raise ActivationError(f"unknown activation operation: {command}")
     except (ActivationError, OSError, ValueError) as error:
         print(f"hooddy: {error}", file=sys.stderr)
         return 1
