@@ -13,6 +13,8 @@
         );
     in
     {
+      lib = import ./lib { inherit nixpkgs; };
+
       packages = forAllSys (pkgs: rec {
         hooddy = pkgs.callPackage ./package.nix { };
         default = hooddy;
@@ -21,6 +23,10 @@
       checks = forAllSys (pkgs: {
         hooddy = pkgs.callPackage ./tests/package.nix {
           hooddy = self.packages.${pkgs.stdenv.hostPlatform.system}.hooddy;
+        };
+        modules = import ./tests/modules.nix {
+          inherit pkgs;
+          inherit (self.lib) hooddyConfiguration;
         };
       });
 
