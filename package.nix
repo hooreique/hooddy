@@ -5,12 +5,15 @@
   caddy,
   coreutils,
   nix,
+  python3,
   systemd,
   util-linux,
 }:
 let
   version = "0.1.0";
-  script = builtins.replaceStrings [ "@version@" "@caddy@" ] [ version "${caddy}" ] (
+  script = builtins.replaceStrings
+    [ "@version@" "@caddy@" "@python@" "@switch@" ]
+    [ version "${caddy}" "${python3}/bin/python3" "${./hooddy-switch.py}" ] (
     builtins.readFile ./hooddy.sh
   );
 in

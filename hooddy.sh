@@ -20,6 +20,8 @@ Commands:
   stop                       Disable and stop the installed service.
   restart                    Reload the running service, or start it if stopped.
                              Preserve its boot-time enablement setting.
+  switch                     Build the locked module configuration and activate
+                             its services and sites, with failure recovery.
 
 All commands except install require an existing installation.
 start, stop, and restart are idempotent.
@@ -56,7 +58,7 @@ case "$command_name" in
     echo "hooddy @version@"
     exit 0
     ;;
-  install|uninstall|start|stop|restart) ;;
+  install|uninstall|start|stop|restart|switch) ;;
   *) die "unknown command: $command_name (see hooddy --help)" ;;
 esac
 
@@ -142,6 +144,12 @@ mkdir -p -- "$config_dir"
 exec 9>"$config_dir/.lock"
 flock 9
 check_installation
+
+# Recover before accepting another lifecycle operation. The activation helper
+# inherits the existing lock; evaluation, mutation and recovery are serialized.
+if path_exists "$config_dir/.switch/journal.json"; then
+  @python@ @switch@ recover || exit 1
+fi
 
 linger_status() {
   loginctl show-user "$(id -un)" --property=Linger --value || die "cannot query user linger with loginctl"
@@ -260,6 +268,9 @@ case "$command_name" in
     install_service
     ;;
   uninstall)
+    if path_exists "$config_dir/.switch/current.json"; then
+      @python@ @switch@ check-uninstall || exit 1
+    fi
     if path_exists "$runtime_root"; then
       [[ -L $runtime_root ]] || die "refusing to remove a non-symlink runtime: $runtime_root"
     fi
@@ -281,5 +292,8 @@ case "$command_name" in
   restart)
     set_linger yes
     systemctl --user reload-or-restart "$unit_name" || die "could not reload or start $unit_name; see journalctl --user -u $unit_name"
+    ;;
+  switch)
+    @python@ @switch@ switch
     ;;
 esac
