@@ -29,5 +29,50 @@ Apply the site and open `http://localhost:8080`.
 nix run github:hooreique/hooddy -- restart
 ```
 
+## Configure a site with Nix
+
+Save these two files in `~/.config/hooddy/` (or `$XDG_CONFIG_HOME/hooddy/`).
+Use `aarch64-linux` on ARM64.
+
+**`~/.config/hooddy/flake.nix`**
+
+```nix
+{
+  inputs.hooddy.url = "github:hooreique/hooddy";
+
+  outputs = { hooddy, ... }: {
+    hooddyConfigurations.default = hooddy.lib.hooddyConfiguration {
+      system = "x86_64-linux";
+      modules = [ ./config.nix ];
+    };
+  };
+}
+```
+
+**`~/.config/hooddy/config.nix`**
+
+```nix
+{
+  hooddy.sites.demo.config = ''
+    http://localhost:8081 {
+      bind 127.0.0.1
+      respond "Hello from hooddy!"
+    }
+  '';
+}
+```
+
+Add `import generated/sites.caddy` to the main `Caddyfile` outside its global
+options block. Then lock the inputs and run the first switch, which creates the
+imported file.
+
+```sh
+cd "${XDG_CONFIG_HOME:-$HOME/.config}/hooddy"
+nix flake lock
+nix run github:hooreique/hooddy -- switch
+```
+
+Open `http://localhost:8081`.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for Nix modules, service commands, and
 development checks. [MIT license](LICENSE).
