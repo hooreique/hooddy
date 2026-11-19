@@ -1,7 +1,7 @@
 # hooddy module protocol design
 
-Status: proposal for review; not implemented. hooddy provides a standalone Nix
-module system for a user's applications and shared Caddy server. It is neither
+hooddy provides a standalone Nix module system for a user's applications and
+shared Caddy server. It is neither
 a NixOS nor a Home Manager module. v1 supports `x86_64-linux` and
 `aarch64-linux` and systemd user services.
 
@@ -54,8 +54,7 @@ host, rather than determined through impure evaluation.
 }
 ```
 
-These app outputs and option names are proposals; neither app provides them
-today. `hooddy.lib.hooddyConfiguration { system, modules, specialArgs ? {} }`
+`hooddy.lib.hooddyConfiguration { system, modules, specialArgs ? {} }`
 evaluates hooddy's built-in module and `modules` using `lib.evalModules`, and
 returns `{ config, options, activationPackage; }`. Modules receive `lib`,
 `config`, `options`, and `pkgs` for the selected system; `specialArgs` adds
@@ -85,9 +84,9 @@ and starts declared services; removing one stops and disables it. A module can
 declare a site, a service, or both. Site files are ordinary Caddyfiles, and
 applications need neither the hooddy CLI nor runtime registration metadata.
 
-Bukupan's module would derive its backend listen address and site proxy from
+Bukupan's module derives its backend listen address and site proxy from
 one host and port, serve its packaged static client, and declare its health
-check. Journal's module would do the same for its backend, preserving its XDG
+check. Journal's module does the same for its backend, preserving its XDG
 data defaults, token and Codex authentication. App modules escape values for
 systemd and Caddy. Statically detectable duplicate ports or domains should fail
 evaluation; Caddy validation and actual binds remain authoritative. DNS,
@@ -129,8 +128,8 @@ backs them up, stops and removes the old managed units and site files, then
 switches, avoiding duplicate domains and ports; app data stays in place. For
 uninstall, switch first to a configuration with no app services. Uninstall
 refuses if switch-managed services remain, and otherwise retains its existing
-behavior. This proposal extends the current development guidance: modules are
-build-time composition, while runtime sites remain ordinary Caddyfiles.
+behavior. Modules provide build-time composition, while runtime sites remain
+ordinary Caddyfiles.
 
 ## Generation and activation
 
@@ -170,15 +169,11 @@ and each phase before mutation. Following interruption, the next invocation
 recovers the previous generation before accepting a new switch. Recovery does
 not undo app data writes or external effects.
 
-## Implementation and acceptance
+## Validation
 
-Implement the evaluator and types, generation builder, and activation/recovery
-in that order. Use fixture modules resembling both apps before changing their
-repositories. Test both supported systems, merging and invalid definitions,
+Use fixture modules resembling both apps. Test both supported systems, merging and invalid definitions,
 locks, GC roots, reconciliation, collisions, additions/changes/removals,
 health and Caddy failures, rollback failure, interrupted recovery, and migration
 conflicts. Verify full Caddy validation with existing sites and empty/populated
 generated files. Use the existing isolated system command substitutes and
-temporary Caddy; never operate the real user's services. Update README and
-AGENTS.md when behavior is implemented. App integrations are follow-up work;
-this document changes no runtime behavior.
+temporary Caddy; never operate the real user's services.
