@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 
 state_path = Path(os.environ["HOODDY_TEST_STATE"])
@@ -154,10 +155,20 @@ elif command == "nix":
     reference = next(a for a in arguments if a.startswith("path:"))
     assert reference.endswith("#hooddyConfigurations.default.activationPackage"), reference
     source = Path(reference[5:].split("#", 1)[0])
+    files = {}
+    for directory, subdirectories, names in os.walk(source):
+        for name in subdirectories + names:
+            path = Path(directory) / name
+            relative = str(path.relative_to(source))
+            if path.is_symlink():
+                files[relative] = {"target": os.readlink(path)}
+            elif path.is_file():
+                files[relative] = {"contents": path.read_bytes().hex(),
+                                   "mode": stat.S_IMODE(path.stat().st_mode)}
     state["builds"].append({
         "source": str(source),
         "lock": (source / "flake.lock").read_text(),
-        "local_file": (source / "untracked.nix").read_text(),
+        "files": files,
     })
     output_link = next((arguments[i + 1] for i, a in enumerate(arguments) if a in ["--out-link", "-o"]), None)
     if output_link:

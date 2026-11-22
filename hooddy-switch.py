@@ -5,6 +5,7 @@ crash recovery can be tested without touching a user's actual services.
 """
 
 import base64
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import http.client
@@ -16,6 +17,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,41 @@ def read_regular(path):
     if not path.is_file():
         raise ActivationError(f"not a regular file: {path}")
     return path.read_bytes()
+
+
+def copy_worktree_file(root, path, destination):
+    with ExitStack() as stack:
+        def open_directory(name, parent=None):
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            stack.callback(os.close, descriptor)
+            return descriptor
+
+        parent = open_directory(root)
+        try:
+            for part in path.parts[:-1]:
+                parent = open_directory(part, parent)
+            mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
+            if stat.S_ISLNK(mode):
+                target = os.readlink(path.name, dir_fd=parent)
+            elif stat.S_ISREG(mode):
+                descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                source = stack.enter_context(os.fdopen(descriptor, "rb"))
+                mode = os.fstat(source.fileno()).st_mode
+                if not stat.S_ISREG(mode):
+                    return
+            else:
+                return
+        except (FileNotFoundError, NotADirectoryError):
+            return
+
+        plain_parents(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if stat.S_ISLNK(mode):
+            destination.symlink_to(target)
+        else:
+            with destination.open("wb") as output:
+                shutil.copyfileobj(source, output)
+                os.fchmod(output.fileno(), stat.S_IMODE(mode))
 
 
 def digest(data):
@@ -283,12 +320,39 @@ class Switch:
         return snapshots, states
 
     def copy_config(self, destination):
-        # Avoid copying roots back into the flake and recursively retaining old
-        # generations. All application source files, including untracked ones,
-        # remain in the snapshot.
-        def ignore(directory, names):
-            return {".switch", ".lock"} & set(names) if Path(directory) == self.config else set()
-        shutil.copytree(self.config, destination, symlinks=True, ignore=ignore)
+        result = subprocess.run(["git", "ls-files", "--cached", "--stage", "-z", "--", "."],
+                                cwd=self.config, env=dict(os.environ, LC_ALL="C"), capture_output=True)
+        if result.returncode:
+            no_repository = result.stderr.startswith((
+                b"fatal: not a git repository (or any parent up to mount point ",
+                b"fatal: not a git repository (or any of the parent directories): .git\n",
+            ))
+            if result.returncode == 128 and no_repository:
+                def ignore(directory, names):
+                    excluded = {".git", ".switch", ".lock"} if Path(directory) == self.config else {".git"}
+                    return excluded.intersection(names)
+                shutil.copytree(self.config, destination, symlinks=True, ignore=ignore)
+                return
+            raise ActivationError(f"git ls-files: {os.fsdecode(result.stderr).strip() or 'failed'}")
+
+        tracked = set()
+        submodules = set()
+        for entry in result.stdout.split(b"\0"):
+            if not entry:
+                continue
+            metadata, name = entry.split(b"\t", 1)
+            path = Path(os.fsdecode(name))
+            if ".git" in path.parts or path.parts[0] in {".switch", ".lock"}:
+                continue
+            mode, _, _ = metadata.split()
+            (submodules if mode == b"160000" else tracked).add(path)
+
+        tracked -= submodules
+        if Path("flake.nix") not in tracked:
+            raise ActivationError("flake.nix must be tracked by Git; run git add flake.nix")
+        destination.mkdir()
+        for path in sorted(tracked | {Path("flake.lock")}):
+            copy_worktree_file(self.config, path, destination / path)
 
     def validate(self, candidate):
         if candidate["manifest"]["enabled"]:

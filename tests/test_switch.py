@@ -67,6 +67,10 @@ class SwitchTests(unittest.TestCase):
         (self.directory / "flake.lock").write_text(self.lock_text)
         (self.directory / "untracked.nix").write_text("untracked configuration\n")
 
+    def git(self, *args, directory=None):
+        subprocess.run(["git", *args], cwd=directory or self.directory,
+                       env=self.env, capture_output=True, check=True)
+
     def generation(self, applications=None, sites="", **manifest_changes):
         self.generation_number += 1
         generation = self.root / f"generation-{self.generation_number}"
@@ -157,18 +161,94 @@ class SwitchTests(unittest.TestCase):
 
     def test_snapshot_includes_local_files_and_preserves_lock(self):
         self.configure()
+        self.env["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "1"
         generation = self.generation()
         self.cli("switch")
         builds = self.state()["builds"]
         self.assertEqual(len(builds), 1)
         self.assertNotEqual(builds[0]["source"], str(self.directory))
         self.assertEqual(builds[0]["lock"], self.lock_text)
-        self.assertEqual(builds[0]["local_file"], "untracked configuration\n")
+        self.assertEqual(bytes.fromhex(builds[0]["files"]["untracked.nix"]["contents"]),
+                         b"untracked configuration\n")
         self.assertEqual((self.directory / "flake.lock").read_text(), self.lock_text)
         self.assertTrue(self.rooted(generation))
 
-    def test_first_switch_creates_a_lock_and_subsequent_switch_reuses_it(self):
+    def test_git_snapshot_uses_worktree_contents_and_preserves_file_types(self):
         self.configure()
+        self.git("init", "--object-format=sha1")
+        unusual = os.fsdecode(b"with space\nline-\xff")
+        script = self.directory / unusual
+        script.write_bytes(b"staged\n")
+        script.chmod(0o755)
+        (self.directory / "link").symlink_to(unusual)
+        (self.directory / "removed").touch()
+        nested = self.directory / "nested"
+        nested.mkdir()
+        (nested / "tracked").write_text("tracked\n")
+        (self.directory / ".lock").touch()
+        (self.directory / ".switch").mkdir()
+        (self.directory / ".switch/source").touch()
+        self.git("add", "--", "flake.nix", unusual, "link", "removed", "nested", ".lock", ".switch")
+        self.git("update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",submodule")
+        (self.directory / "submodule").mkdir()
+        (self.directory / "submodule/file").touch()
+        script.write_bytes(b"unstaged\n")
+        (self.directory / "removed").unlink()
+        (nested / "tracked").rename(self.root / "tracked")
+        nested.rmdir()
+        nested.symlink_to(self.root)
+        for name in ("result", "result-extra"):
+            (self.directory / name).symlink_to(self.root)
+
+        self.generation()
+        self.cli("switch")
+        build, = self.state()["builds"]
+        self.assertEqual(set(build["files"]), {"flake.nix", "flake.lock", unusual, "link"})
+        self.assertEqual(build["files"][unusual], {"contents": b"unstaged\n".hex(), "mode": 0o755})
+        self.assertEqual(build["files"]["link"], {"target": unusual})
+        self.assertEqual(build["lock"], self.lock_text)
+        self.assertFalse(any(call[:3] == ["nix", "flake", "lock"] for call in self.state()["calls"]))
+
+    def test_snapshot_is_scoped_to_config_in_linked_worktree(self):
+        repository = self.root / "repository"
+        repository.mkdir()
+        self.git("init", directory=repository)
+        (repository / ".config/hooddy").mkdir(parents=True)
+        (repository / ".config/hooddy/flake.nix").write_text("{}\n")
+        (repository / "outside").touch()
+        self.git("add", ".", directory=repository)
+        self.git("-c", "user.name=Hooddy Test", "-c", "user.email=test@example.com",
+                 "commit", "-m", "Initial configuration", directory=repository)
+        self.directory.rmdir()
+        self.directory.parent.rmdir()
+        worktree = self.root / "worktree"
+        self.git("worktree", "add", "--detach", str(worktree), directory=repository)
+        self.env["HOME"] = str(worktree)
+        self.directory = worktree / ".config/hooddy"
+        self.configure()
+        self.generation()
+        self.cli("switch")
+        self.assertEqual(set(self.state()["builds"][0]["files"]), {"flake.nix", "flake.lock"})
+
+    def test_untracked_git_flake_fails_before_nix(self):
+        self.configure()
+        self.git("init")
+        result = self.cli("switch", code=1)
+        self.assertIn("git add flake.nix", result.stderr)
+        self.assertFalse(any(call[0] == "nix" for call in self.state()["calls"]))
+
+    def test_git_lookup_failure_fails_before_nix(self):
+        self.configure()
+        self.git("init")
+        (self.directory / ".git/index").write_bytes(b"invalid index")
+        result = self.cli("switch", code=1)
+        self.assertIn("git ls-files:", result.stderr)
+        self.assertFalse(any(call[0] == "nix" for call in self.state()["calls"]))
+
+    def test_first_git_switch_creates_a_lock_and_subsequent_switch_reuses_it(self):
+        self.configure()
+        self.git("init")
+        self.git("add", "flake.nix")
         lock = self.directory / "flake.lock"
         lock.unlink()
         self.generation()

@@ -3,6 +3,7 @@
   writeShellApplication,
   writeText,
   coreutils,
+  git,
   nix,
   python3,
   systemd,
@@ -18,7 +19,7 @@ in
 writeShellApplication {
   name = "hooddy";
   derivationArgs = { inherit version; };
-  runtimeInputs = [ coreutils nix systemd ];
+  runtimeInputs = [ coreutils git nix systemd ];
   text = script;
 
   passthru.testScript = writeText "hooddy-test-script" script;
