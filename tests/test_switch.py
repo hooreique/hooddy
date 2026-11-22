@@ -230,6 +230,21 @@ class SwitchTests(unittest.TestCase):
         self.cli("switch")
         self.assertEqual(set(self.state()["builds"][0]["files"]), {"flake.nix", "flake.lock"})
 
+    def test_failed_build_hints_at_untracked_nix_files(self):
+        self.configure()
+        self.git("init")
+        self.git("add", "flake.nix")
+        self.generation()
+        hint = "Hint: Check git status and stage any needed files."
+        self.assertNotIn(hint, self.cli("switch").stderr)
+
+        self.change_state(fail_once=["nix:build"])
+        self.assertIn(hint, self.cli("switch", code=1).stderr)
+
+        (self.directory / ".gitignore").write_text("untracked.nix\n")
+        self.change_state(fail_once=["nix:build"])
+        self.assertNotIn(hint, self.cli("switch", code=1).stderr)
+
     def test_untracked_git_flake_fails_before_nix(self):
         self.configure()
         self.git("init")
