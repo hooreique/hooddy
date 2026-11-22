@@ -354,6 +354,17 @@ class Switch:
         for path in sorted(tracked | {Path("flake.lock")}):
             copy_worktree_file(self.config, path, destination / path)
 
+    def has_untracked_nix_files(self):
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z", "--",
+                 "*.nix", ":!.switch"],
+                cwd=self.config, capture_output=True,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0 and bool(result.stdout)
+
     def validate(self, candidate):
         if candidate["manifest"]["enabled"]:
             generation_dir = Path(candidate["generation"])
@@ -526,8 +537,15 @@ class Switch:
                 raise ActivationError("flake.lock changed while snapshotting configuration")
             try:
                 self.root("candidate", None)
-                run("nix", "build", "--no-update-lock-file", "--no-write-lock-file", "--out-link",
-                    str(self.roots / "candidate"), f"path:{snapshot}#hooddyConfigurations.default.activationPackage")
+                try:
+                    run("nix", "build", "--no-update-lock-file", "--no-write-lock-file", "--out-link",
+                        str(self.roots / "candidate"), f"path:{snapshot}#hooddyConfigurations.default.activationPackage")
+                except ActivationError as error:
+                    if self.has_untracked_nix_files():
+                        raise ActivationError(
+                            f"{error}\nHint: Check git status and stage any needed files."
+                        ) from error
+                    raise
                 candidate, files = generation(self.roots / "candidate")
                 candidate["unitDirectory"] = str(self.units)
                 if read_regular(snapshot / "flake.lock") != lock or read_regular(lock_file) != lock:
