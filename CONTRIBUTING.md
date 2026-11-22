@@ -57,7 +57,11 @@ paths and the unit must have `[Install]` with `WantedBy=default.target`.
 The [example application module](tests/fixtures/application.nix) defines a
 backend, its health check, and a reverse proxy.
 
-Nix takes a snapshot of the flake directory, including untracked source files.
+Inside a Git worktree, `hooddy switch` snapshots the current contents of
+files tracked under the configuration directory, including unstaged edits.
+Use `git add` to include new source files such as `flake.nix`. Deleted files
+and submodules are skipped. Outside a Git worktree, the snapshot includes
+untracked source files. An existing `flake.lock` is included either way.
 Keep credentials outside that directory and use protected runtime files for
 secrets. Paths and text included in a generation are readable in the Nix store.
 
